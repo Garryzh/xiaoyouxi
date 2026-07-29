@@ -4,9 +4,10 @@ CelesTrak TLE + satellite.js SGP4 · 纯前端 3D 地球实时演示。
 
 ## 原理
 
-1. 从 [CelesTrak](https://celestrak.org/NORAD/elements/) 拉取 `GROUP=active` TLE（约每 2 小时缓存一次）
-2. 用 [satellite.js](https://github.com/shashwatak/satellite-js) 在浏览器内做 SGP4 推算
-3. 每帧更新数千颗卫星位置 → **实时运动来自本地物理计算，不轮询 API**
+1. 优先加载内置 `data/catalog.tle` 快照（离线可用）
+2. 后台按分组从 [CelesTrak](https://celestrak.org/NORAD/elements/) 刷新（避免被 403 的超大 `active`/`starlink` 整包）
+3. 用 [satellite.js](https://github.com/shashwatak/satellite-js) 在浏览器内做 SGP4 推算
+4. 每帧更新卫星位置 → **实时运动来自本地物理计算，不轮询 API**
 
 ## 运行
 

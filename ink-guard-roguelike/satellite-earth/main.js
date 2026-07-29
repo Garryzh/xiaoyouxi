@@ -15,9 +15,23 @@ import * as satellite from 'satellite.js';
 const EARTH_RADIUS_KM = 6371.0;
 const SCENE_EARTH_R = 1.0;
 const KM_TO_SCENE = SCENE_EARTH_R / EARTH_RADIUS_KM;
-const CACHE_KEY = 'orbitlive-tle-v1';
+const CACHE_KEY = 'orbitlive-tle-v2';
 const CACHE_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
-const TLE_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle';
+const LOCAL_TLE = './data/catalog.tle';
+// CelesTrak blocks some huge GROUP downloads (e.g. active/starlink) with 403.
+// Use smaller groups + supplemental Starlink feed instead.
+const TLE_SOURCES = [
+  'https://celestrak.org/NORAD/elements/supplemental/sup-gp.php?FILE=starlink&FORMAT=tle',
+  'https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle',
+  'https://celestrak.org/NORAD/elements/gp.php?GROUP=oneweb&FORMAT=tle',
+  'https://celestrak.org/NORAD/elements/gp.php?GROUP=gps-ops&FORMAT=tle',
+  'https://celestrak.org/NORAD/elements/gp.php?GROUP=glo-ops&FORMAT=tle',
+  'https://celestrak.org/NORAD/elements/gp.php?GROUP=galileo&FORMAT=tle',
+  'https://celestrak.org/NORAD/elements/gp.php?GROUP=beidou&FORMAT=tle',
+  'https://celestrak.org/NORAD/elements/gp.php?GROUP=iridium-NEXT&FORMAT=tle',
+  'https://celestrak.org/NORAD/elements/gp.php?GROUP=weather&FORMAT=tle',
+  'https://celestrak.org/NORAD/elements/gp.php?GROUP=visual&FORMAT=tle',
+];
 
 const GROUPS = [
   { id: 'starlink', label: '星链', en: 'Starlink', color: '#5ee7ff' },
@@ -66,6 +80,7 @@ function revealUI() {
 function parseTleText(text) {
   const lines = text.replace(/\r/g, '').split('\n').map((l) => l.trim()).filter(Boolean);
   const records = [];
+  const seen = new Set();
   for (let i = 0; i < lines.length;) {
     let name = 'UNKNOWN';
     let l1;
@@ -86,6 +101,9 @@ function parseTleText(text) {
     try {
       const satrec = satellite.twoline2satrec(l1, l2);
       if (satrec.error) continue;
+      const id = String(satrec.satnum || `${l1}|${l2}`);
+      if (seen.has(id)) continue;
+      seen.add(id);
       records.push({
         name,
         satrec,
@@ -151,7 +169,7 @@ async function fetchText(url) {
       const res = await fetch(u, { cache: 'no-cache' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const text = await res.text();
-      if (!text || text.length < 200 || text.includes('<html')) {
+      if (!text || text.length < 200 || /<!doctype html|<html/i.test(text)) {
         throw new Error('Unexpected response body');
       }
       return text;
@@ -162,8 +180,26 @@ async function fetchText(url) {
   throw lastErr || new Error('Failed to fetch TLE');
 }
 
+async function fetchLiveCatalog(onProgress) {
+  const chunks = [];
+  let ok = 0;
+  for (let i = 0; i < TLE_SOURCES.length; i++) {
+    const url = TLE_SOURCES[i];
+    onProgress?.(`在线刷新 ${i + 1}/${TLE_SOURCES.length}…`);
+    try {
+      const text = await fetchText(url);
+      chunks.push(text);
+      ok += 1;
+    } catch {
+      // continue with other groups
+    }
+  }
+  if (!ok) throw new Error('所有在线 TLE 源均失败');
+  return chunks.join('\n');
+}
+
 async function loadTleCatalog(onProgress) {
-  // IndexedDB / localStorage cache
+  // 1) memory/localStorage cache
   try {
     const raw = localStorage.getItem(CACHE_KEY);
     if (raw) {
@@ -174,28 +210,48 @@ async function loadTleCatalog(onProgress) {
           text: cached.text,
           fetchedAt: cached.fetchedAt,
           fromCache: true,
+          source: 'cache',
         };
       }
     }
   } catch {
-    // ignore cache read errors
+    // ignore
   }
 
-  onProgress?.('正在从 CelesTrak 拉取 active TLE…');
-  const text = await fetchText(TLE_URL);
+  // 2) bundled snapshot (works offline / without CORS)
+  try {
+    onProgress?.('加载内置 TLE 快照…');
+    const res = await fetch(LOCAL_TLE, { cache: 'force-cache' });
+    if (res.ok) {
+      const text = await res.text();
+      if (text && text.length > 500 && text.includes('\n1 ')) {
+        const fetchedAt = Date.now();
+        try {
+          localStorage.setItem(CACHE_KEY, JSON.stringify({ text, fetchedAt, source: 'bundle' }));
+        } catch {
+          // quota — ignore
+        }
+        return { text, fetchedAt, fromCache: false, source: 'bundle' };
+      }
+    }
+  } catch {
+    // fall through to live
+  }
+
+  // 3) live multi-group CelesTrak
+  onProgress?.('正在从 CelesTrak 分组拉取 TLE…');
+  const text = await fetchLiveCatalog(onProgress);
   const fetchedAt = Date.now();
   try {
-    // May fail if quota exceeded (TLE ~2–3 MB)
-    localStorage.setItem(CACHE_KEY, JSON.stringify({ text, fetchedAt }));
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ text, fetchedAt, source: 'live' }));
   } catch {
     try {
-      // Store a lighter marker; full text kept in memory only
       localStorage.setItem(CACHE_KEY, JSON.stringify({ fetchedAt, truncated: true }));
     } catch {
       // ignore
     }
   }
-  return { text, fetchedAt, fromCache: false };
+  return { text, fetchedAt, fromCache: false, source: 'live' };
 }
 
 function formatAge(fetchedAt) {
@@ -265,6 +321,7 @@ let orbitLine;
 let footprintLine;
 let earth;
 let clouds;
+let sunLight;
 
 function createStarfield() {
   const count = 4000;
@@ -292,86 +349,116 @@ function createStarfield() {
   return new THREE.Points(geo, mat);
 }
 
+let earthSunDir = new THREE.Vector3(-0.85, 0.15, 0.5).normalize();
+let earthMat = null;
+
 function createEarth() {
   const group = new THREE.Group();
   const loaderTex = new THREE.TextureLoader();
-  const maxAniso = 8;
 
-  const dayMap = loaderTex.load(
-    'https://cdn.jsdelivr.net/npm/three@0.178.0/examples/textures/planets/earth_atmos_2048.jpg',
-  );
+  const dayMap = loaderTex.load('./assets/earth-day.jpg');
   dayMap.colorSpace = THREE.SRGBColorSpace;
-  dayMap.anisotropy = maxAniso;
+  dayMap.anisotropy = 8;
 
-  const specMap = loaderTex.load(
-    'https://cdn.jsdelivr.net/npm/three@0.178.0/examples/textures/planets/earth_specular_2048.jpg',
+  // Night lights map: luminance ≈ urban density
+  const nightMap = loaderTex.load(
+    './assets/earth-night.jpg',
+    () => { console.info('[orbitlive] night map loaded', nightMap.image?.width, nightMap.image?.height); },
+    undefined,
+    (err) => { console.error('[orbitlive] night map failed', err); },
   );
-  const normalMap = loaderTex.load(
-    'https://cdn.jsdelivr.net/npm/three@0.178.0/examples/textures/planets/earth_normal_2048.jpg',
-  );
+  // Keep linear for emissive-like city lights (avoid crushing dim pixels)
+  nightMap.colorSpace = THREE.NoColorSpace;
+  nightMap.anisotropy = 8;
 
-  const earthMat = new THREE.MeshPhongMaterial({
-    map: dayMap,
-    specularMap: specMap,
-    normalMap,
-    specular: new THREE.Color(0x222222),
-    shininess: 12,
+  earthMat = new THREE.ShaderMaterial({
+    uniforms: {
+      dayMap: { value: dayMap },
+      nightMap: { value: nightMap },
+      sunDirection: { value: earthSunDir.clone() },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      varying vec3 vNormalW;
+      void main() {
+        vUv = uv;
+        vNormalW = normalize(mat3(modelMatrix) * normal);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform sampler2D dayMap;
+      uniform sampler2D nightMap;
+      uniform vec3 sunDirection;
+      varying vec2 vUv;
+      varying vec3 vNormalW;
+
+      void main() {
+        vec3 n = normalize(vNormalW);
+        float ndl = dot(n, normalize(sunDirection));
+
+        // Soft day / night blend
+        float dayFactor = smoothstep(-0.15, 0.25, ndl);
+        float nightFactor = 1.0 - smoothstep(-0.08, 0.22, ndl);
+
+        vec3 day = texture2D(dayMap, vUv).rgb;
+        vec3 lights = texture2D(nightMap, vUv).rgb;
+
+        // Urban density ≈ night-map luminance (cities / metro clusters)
+        float density = max(lights.r, max(lights.g, lights.b));
+        density = pow(clamp(density, 0.0, 1.0), 0.75);
+
+        // Warm city glow — brighter where density is higher
+        vec3 city = lights * vec3(2.0, 1.35, 0.7) * (0.55 + density * 6.5);
+
+        vec3 litDay = day * (0.38 + 0.62 * clamp(ndl, 0.0, 1.0));
+        vec3 nightSide = day * 0.025 + city;
+
+        vec3 color = mix(nightSide, litDay, dayFactor);
+        color += city * nightFactor * 0.4;
+        color = max(color, city * nightFactor * 0.85);
+
+        gl_FragColor = vec4(color, 1.0);
+      }
+    `,
   });
-  earth = new THREE.Mesh(new THREE.SphereGeometry(SCENE_EARTH_R, 96, 64), earthMat);
+
+  earth = new THREE.Mesh(new THREE.SphereGeometry(SCENE_EARTH_R, 128, 96), earthMat);
   group.add(earth);
 
-  // Atmosphere glow (back-side fresnel-ish)
+  // Thin cyan atmosphere rim only (keep intensity low — additive can white-out)
   const atmosMat = new THREE.ShaderMaterial({
     transparent: true,
     depthWrite: false,
     side: THREE.BackSide,
+    blending: THREE.AdditiveBlending,
     uniforms: {
-      glowColor: { value: new THREE.Color(0x4db8ff) },
-      coef: { value: 0.35 },
-      power: { value: 3.2 },
+      glowColor: { value: new THREE.Color(0x4ab8ff) },
     },
     vertexShader: `
       varying vec3 vNormal;
-      varying vec3 vWorldPos;
+      varying vec3 vView;
       void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
         vNormal = normalize(normalMatrix * normal);
-        vec4 world = modelMatrix * vec4(position, 1.0);
-        vWorldPos = world.xyz;
-        gl_Position = projectionMatrix * viewMatrix * world;
+        vView = normalize(-mv.xyz);
+        gl_Position = projectionMatrix * mv;
       }
     `,
     fragmentShader: `
       uniform vec3 glowColor;
-      uniform float coef;
-      uniform float power;
       varying vec3 vNormal;
-      varying vec3 vWorldPos;
+      varying vec3 vView;
       void main() {
-        vec3 viewDir = normalize(cameraPosition - vWorldPos);
-        float intensity = pow(coef + abs(dot(vNormal, viewDir)), power);
-        gl_FragColor = vec4(glowColor, 1.0) * intensity * 0.55;
+        float fresnel = pow(1.0 - abs(dot(normalize(vNormal), normalize(vView))), 3.5);
+        float intensity = fresnel * 0.45;
+        gl_FragColor = vec4(glowColor * intensity, intensity);
       }
     `,
   });
-  const atmos = new THREE.Mesh(new THREE.SphereGeometry(SCENE_EARTH_R * 1.045, 64, 48), atmosMat);
-  group.add(atmos);
+  group.add(new THREE.Mesh(new THREE.SphereGeometry(SCENE_EARTH_R * 1.045, 64, 48), atmosMat));
 
-  // Soft cloud layer
-  const cloudMap = loaderTex.load(
-    'https://cdn.jsdelivr.net/npm/three@0.178.0/examples/textures/planets/earth_clouds_1024.png',
-  );
-  cloudMap.colorSpace = THREE.SRGBColorSpace;
-  clouds = new THREE.Mesh(
-    new THREE.SphereGeometry(SCENE_EARTH_R * 1.008, 64, 48),
-    new THREE.MeshLambertMaterial({
-      map: cloudMap,
-      transparent: true,
-      opacity: 0.28,
-      depthWrite: false,
-    }),
-  );
-  group.add(clouds);
-
+  clouds = null;
   return group;
 }
 
@@ -398,10 +485,10 @@ function buildSatellitePoints(catalog) {
   }
 
   const mat = new THREE.PointsMaterial({
-    size: 0.012,
+    size: 0.018,
     vertexColors: true,
     transparent: true,
-    opacity: 0.95,
+    opacity: 0.92,
     depthWrite: false,
     blending: THREE.AdditiveBlending,
     sizeAttenuation: true,
@@ -631,24 +718,27 @@ function setupRenderer() {
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.05;
+  renderer.toneMappingExposure = 1.0;
   document.body.appendChild(renderer.domElement);
 
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x02060c);
-  scene.fog = new THREE.FogExp2(0x02060c, 0.012);
+  scene.fog = new THREE.FogExp2(0x02060c, 0.006);
 
   camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.05, 200);
-  camera.position.set(0.8, 1.15, 2.55);
+  camera.position.set(0.55, 0.85, 2.35);
 
-  const ambient = new THREE.AmbientLight(0x445566, 0.55);
+  const ambient = new THREE.AmbientLight(0x6a7f99, 0.45);
   scene.add(ambient);
-  const sun = new THREE.DirectionalLight(0xfff2e0, 1.35);
-  sun.position.set(5, 2, 3);
-  scene.add(sun);
-  const fill = new THREE.DirectionalLight(0x3366aa, 0.25);
-  fill.position.set(-4, -1, -2);
+  sunLight = new THREE.DirectionalLight(0xfff1dd, 1.85);
+  sunLight.position.copy(earthSunDir).multiplyScalar(8);
+  scene.add(sunLight);
+  const fill = new THREE.DirectionalLight(0x3a6aaa, 0.3);
+  fill.position.set(-4, -0.5, -2.5);
   scene.add(fill);
+  const rim = new THREE.DirectionalLight(0x88ccff, 0.22);
+  rim.position.set(-2, 3, -4);
+  scene.add(rim);
 
   scene.add(createStarfield());
   scene.add(createEarth());
@@ -685,20 +775,24 @@ async function init() {
 
   let catalog;
   let fetchedAt;
-  let fromCache = false;
+  let sourceLabel = '内置快照';
 
   try {
     const pack = await loadTleCatalog(setStatus);
     fetchedAt = pack.fetchedAt;
-    fromCache = pack.fromCache;
-    setStatus(`解析 TLE（${fromCache ? '缓存' : 'CelesTrak'}）…`);
+    sourceLabel = pack.fromCache
+      ? '缓存'
+      : pack.source === 'live'
+        ? '在线'
+        : '内置快照';
+    setStatus(`解析 TLE（${sourceLabel}）…`);
     catalog = parseTleText(pack.text);
     if (!catalog.length) throw new Error('TLE 解析结果为空');
   } catch (err) {
     console.error(err);
     setStatus('TLE 加载失败', { error: true });
     loader.querySelector('.loader-note').textContent =
-      `${err?.message || err} — 请检查网络，或稍后重试。CelesTrak 可直连或经 CORS 代理。`;
+      `${err?.message || err} — 请确认 data/catalog.tle 存在，或检查网络后刷新。`;
     return;
   }
 
@@ -712,9 +806,7 @@ async function init() {
   renderGroupButtons(counts);
   updateVisibilityMask();
 
-  metaEl.innerHTML = `<strong>${catalog.length.toLocaleString()}</strong> / ${catalog.length.toLocaleString()} 颗在轨目标 · TLE ${
-    fromCache ? '缓存' : '在线'
-  }更新于 <strong>${formatAge(fetchedAt)}</strong>`;
+  metaEl.innerHTML = `<strong>${catalog.length.toLocaleString()}</strong> / ${catalog.length.toLocaleString()} 颗在轨目标 · TLE ${sourceLabel} · <strong>${formatAge(fetchedAt)}</strong>`;
 
   // Initial propagate
   updateSatellites(new Date(simTime));
@@ -744,6 +836,15 @@ async function init() {
     }
 
     if (clouds) clouds.rotation.y += dt * 0.003;
+
+    // Slow sun drift so night-side city density lights sweep into view
+    if (!paused && earthMat?.uniforms?.sunDirection) {
+      const ang = dt * 0.04 * Math.min(timeScale, 60);
+      earthSunDir.applyAxisAngle(new THREE.Vector3(0, 1, 0), ang);
+      earthMat.uniforms.sunDirection.value.copy(earthSunDir);
+      if (sunLight) sunLight.position.copy(earthSunDir).multiplyScalar(8);
+    }
+
     controls.update();
     renderer.render(scene, camera);
 
@@ -758,17 +859,21 @@ async function init() {
     }
   });
 
-  // Background refresh when cache ages out
+  // Background refresh when cache ages out (live multi-group)
   setInterval(async () => {
     try {
       const raw = localStorage.getItem(CACHE_KEY);
       const cached = raw ? JSON.parse(raw) : null;
       if (cached?.fetchedAt && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return;
-      const pack = await loadTleCatalog();
-      // Soft reload: parse & swap satrecs keeping UI
+      const text = await fetchLiveCatalog();
+      const pack = { text, fetchedAt: Date.now(), source: 'live' };
+      try {
+        localStorage.setItem(CACHE_KEY, JSON.stringify(pack));
+      } catch {
+        // ignore quota
+      }
       const next = parseTleText(pack.text);
-      if (next.length > 1000) {
-        // Full rebuild of points is simplest
+      if (next.length > 500) {
         scene.remove(points);
         points.geometry.dispose();
         points.material.dispose();
@@ -777,7 +882,7 @@ async function init() {
         const c2 = Object.fromEntries(GROUPS.map((g) => [g.id, 0]));
         for (const s of next) c2[s.group] = (c2[s.group] || 0) + 1;
         renderGroupButtons(c2);
-        metaEl.innerHTML = `<strong>${next.length.toLocaleString()}</strong> / ${next.length.toLocaleString()} 颗在轨目标 · TLE 在线更新于 <strong>${formatAge(pack.fetchedAt)}</strong>`;
+        metaEl.innerHTML = `<strong>${next.length.toLocaleString()}</strong> / ${next.length.toLocaleString()} 颗在轨目标 · TLE 在线 · <strong>${formatAge(pack.fetchedAt)}</strong>`;
       }
     } catch (e) {
       console.warn('[orbitlive] background refresh failed', e);
